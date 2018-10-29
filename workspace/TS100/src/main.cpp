@@ -3,6 +3,8 @@
 #include <gui.hpp>
 #include <main.hpp>
 #include "LIS2DH12.hpp"
+#include <history.hpp>
+#include <power.hpp>
 #include "Settings.h"
 #include "Translation.h"
 #include "cmsis_os.h"
@@ -535,8 +537,10 @@ static void gui_solderingMode(uint8_t jumpToSleep) {
 			if (systemSettings.detailedSoldering) {
 				OLED::setFont(1);
 				OLED::print(SolderingAdvancedPowerPrompt);  // Power:
-				OLED::printNumber(getTipPWM(), 3);
-				OLED::print("%");
+				OLED::printNumber(milliWattHistory[0] / 1000, 2);
+				OLED::drawChar('.');
+				OLED::printNumber(milliWattHistory[0] / 100 % 10, 1);
+				OLED::drawChar('W');
 
 				if (systemSettings.sensitivity && systemSettings.SleepTime) {
 					OLED::print(" ");
@@ -547,8 +551,8 @@ static void gui_solderingMode(uint8_t jumpToSleep) {
 				OLED::print(SleepingTipAdvancedString);
 				gui_drawTipTemp(true);
 				OLED::print(" ");
-				printVoltage();
-				OLED::drawChar('V');
+//				printVoltage();
+//				OLED::drawChar('V');
 			} else {
 				// We switch the layout direction depending on the orientation of the
 				// OLED::
@@ -894,6 +898,19 @@ void startGUITask(void const *argument __unused) {
 	}
 }
 
+void debugNumber(int32_t val) {
+	if (abs(val) > 99999) {
+		OLED::print(" OoB"); // out of bounds
+		return;
+	}
+	if (val >= 0)
+		OLED::printNumber(val, 5);
+	else {
+		OLED::print("-");
+		OLED::printNumber(-val, 5);
+	}
+}
+
 /* StartPIDTask function */
 void startPIDTask(void const *argument __unused) {
 	/*
@@ -906,13 +923,13 @@ void startPIDTask(void const *argument __unused) {
 	 * struct
 	 *
 	 */
-	setTipPWM(0);  // disable the output driver if the output is set to be off
+	setTipMilliWatts(0);  // disable the output driver if the output is set to be off
 #ifdef MODEL_TS100
-			for (uint8_t i = 0; i < 50; i++) {
-				osDelay(10);
-				getTipRawTemp(1);  // cycle up the tip temp filter
-				HAL_IWDG_Refresh(&hiwdg);
-			}
+	for (uint8_t i = 0; i < 50; i++) {
+		osDelay(10);
+		getTipRawTemp(1);  // cycle up the tip temp filter
+		HAL_IWDG_Refresh(&hiwdg);
+	}
 #else
 	// On the TS80 we can measure the tip resistance before cycling the filter a
 	// bit
@@ -927,16 +944,11 @@ void startPIDTask(void const *argument __unused) {
 	HAL_IWDG_Refresh(&hiwdg);
 
 #endif
+	int32_t rawC = ctoTipMeasurement(100) - ctoTipMeasurement(101);  // 1*C change in raw.
 	currentlyActiveTemperatureTarget = 0; // Force start with no output (off). If in sleep / soldering this will
-										  // be over-ridded rapidly
-	int32_t integralCount = 0;
-	int32_t derivativeLastValue = 0;
+										  // be over-ridden rapidly
+	history<int16_t> tempError = {{0}, 0, 0};
 
-	// REMEBER ^^^^ These constants are backwards
-	// They act as dividers, so to 'increase' a P term, you make the number
-	// smaller.
-
-	const int32_t itermMax = 100;
 	pidTaskNotification = xTaskGetCurrentTaskHandle();
 	for (;;) {
 		if (ulTaskNotifyTake(pdTRUE, 50)) {
@@ -944,69 +956,53 @@ void startPIDTask(void const *argument __unused) {
 			// This is a call to block this thread until the ADC does its samples
 			uint16_t rawTemp = getTipRawTemp(1);  // get instantaneous reading
 			if (currentlyActiveTemperatureTarget) {
-				// Compute the PID loop in here
-				// Because our values here are quite large for all measurements (0-32k
-				// ~= 66 counts per C) P I & D are divisors, so inverse logic applies
-				// (beware)
-
 				// Cap the max set point to 450C
 				if (currentlyActiveTemperatureTarget > ctoTipMeasurement(450)) {
 					currentlyActiveTemperatureTarget = ctoTipMeasurement(450);
 				}
 
-				int32_t rawTempError = currentlyActiveTemperatureTarget
-						- rawTemp;
+				// As we get close to our target, temp noise causes the system
+				//  to be unstable. Use a rolling average to dampen it.
+				// We overshoot by roughly 1/2 of 1 degree Fahrenheit.
+				//  This helps stabilize the display.
+				tempError.update(currentlyActiveTemperatureTarget - rawTemp + rawC/4);
 
-				int32_t ierror = (rawTempError
-						/ ((int32_t) systemSettings.PID_I));
+				// Now for the PID!
+				int32_t milliWattsOut = 0;
 
-				integralCount += ierror;
+				// P term - total power needed to hit target temp next cycle.
+				// thermal mass = 1690 milliJ/*C for my tip.
+				//  = Watts*Seconds to raise Temp from room temp to +100*C, divided by 100*C.
+				// divided by 4 to let I term dominate near set point.
+				const uint16_t mass = 1690 / 4;
+				int32_t milliWattsNeeded = tempToMilliWatts(tempError.average(), mass, rawC);
+				milliWattsOut += milliWattsNeeded;
 
-				if (integralCount > (itermMax / 2))
-					integralCount = itermMax / 2;  // prevent too much lead
-				else if (integralCount < -itermMax)
-					integralCount = itermMax;
+				// I term - energy needed to compensate for heat loss.
+				// We track energy put into the system over some window.
+				// Assuming the temp is stable, energy in = energy transfered.
+				//  (If it isn't, P will dominate).
+				milliWattsOut += milliWattHistory.average();
 
-				int32_t dInput = (rawTemp - derivativeLastValue);
+				// D term - use sudden temp change to counter fast cooling/heating.
+				//  In practice, this provides an early boost if temp is dropping
+				//  and counters extra power if the iron is no longer losing temp.
 
-				/*Compute PID Output*/
-				int32_t output = (rawTempError
-						/ ((int32_t) systemSettings.PID_P));
-				if (((int32_t) systemSettings.PID_I))
-					output += integralCount;
-				if (((int32_t) systemSettings.PID_D))
-					output -= (dInput / ((int32_t) systemSettings.PID_D));
-
-				if (output > 100) {
-					output = 100;  // saturate
-				} else if (output < 0) {
-					output = 0;
-				}
-
-				if (currentlyActiveTemperatureTarget < rawTemp) {
-					output = 0;
-					integralCount = 0;
-					derivativeLastValue = 0;
-				}
-				setTipPWM(output);
-				derivativeLastValue = rawTemp;  // store for next loop
-
+//				debugNumber(0);
+				setTipMilliWatts(milliWattsOut);
 			} else {
-				setTipPWM(0); // disable the output driver if the output is set to be off
-				integralCount = 0;
-				derivativeLastValue = 0;
+				setTipMilliWatts(0);
 			}
 
 			HAL_IWDG_Refresh(&hiwdg);
 		} else {
 			if (currentlyActiveTemperatureTarget == 0) {
-				setTipPWM(0); // disable the output driver if the output is set to be off
-				integralCount = 0;
-				derivativeLastValue = 0;
+				setTipMilliWatts(0);
 			}
 		}
 	}
 }
+
 #define MOVFilter 8
 void startMOVTask(void const *argument __unused) {
 	OLED::setRotation(false);

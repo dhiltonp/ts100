@@ -118,28 +118,16 @@ uint16_t lookupTipDefaultCalValue(enum TipType tipID) {
 #endif
 }
 
-uint16_t getTipRawTemp(uint8_t instant) {
-	static int64_t filterFP = 0;
+uint16_t getTipRawTemp(uint8_t refresh) {
 	static uint16_t lastSample = 0;
-	const uint8_t filterBeta = 7; // higher values smooth out more, but reduce responsiveness
 
-	if (instant == 1) {
-		uint16_t itemp = getTipInstantTemperature();
-		filterFP = (filterFP << filterBeta) - filterFP;
-		filterFP += (itemp << 9);
-		filterFP = filterFP >> filterBeta;
-		uint16_t temp = itemp;
-		itemp += lastSample;
-		itemp /= 2;
-		lastSample = temp;
-		return itemp;
-	} else if (instant == 2) {
-		filterFP = (getTipInstantTemperature() << 8);
-		return filterFP >> 9;
-	} else {
-		return filterFP >> 9;
+	if (refresh) {
+		lastSample = getTipInstantTemperature();
 	}
+
+	return lastSample;
 }
+
 uint16_t getInputVoltageX10(uint16_t divisor) {
 	// ADC maximum is 32767 == 3.3V at input == 28.05V at VIN
 	// Therefore we can divide down from there
