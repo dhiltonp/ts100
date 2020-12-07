@@ -11,6 +11,7 @@
 
 static int32_t PWMToX10Watts(uint8_t pwm, uint8_t sample);
 
+history<uint32_t, oscillationPeriod> x10WattHistory_orig = { { 0 }, 0, 0 };
 expMovingAverage<uint32_t, wattHistoryFilter> x10WattHistory = { 0 };
 
 int32_t tempToX10Watts(int32_t rawTemp) {
@@ -27,6 +28,7 @@ void setTipX10Watts(int32_t mw) {
 	uint32_t actualMilliWatts = PWMToX10Watts(output, 0);
 
 	x10WattHistory.update(actualMilliWatts);
+	x10WattHistory_orig.update(actualMilliWatts);
 }
 
 static uint32_t availableW10(uint8_t sample) {
