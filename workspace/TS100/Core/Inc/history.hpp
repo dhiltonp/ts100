@@ -19,15 +19,14 @@ struct history {
 	uint8_t loc;
 
 	void update(T const val) {
-		// step backwards so i+1 is the previous value.
-		loc = (loc + 1) % size;
 		sum -= buf[loc];
 		sum += val;
 		buf[loc] = val;
+		loc = (loc + 1) % size;
 	}
 
 	T operator[](uint8_t i) const {
-		// 0 = newest, size-1 = oldest.
+		// 0 = oldest, size-1 = newest.
 		i = (i + loc) % size;
 		return buf[i];
 	}
